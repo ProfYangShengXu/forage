@@ -1,0 +1,26 @@
+# ── 数据（★ 不进仓：第三方文章版权 + 41 MB 体积）
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# ── 凭据
+.env
+*.env
+secrets/
+!*.env.example
+
+# ── Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ── 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
