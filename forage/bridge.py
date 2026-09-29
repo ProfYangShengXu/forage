@@ -25,17 +25,18 @@ from pathlib import Path
 
 def _default_mb_root() -> str:
     import os
+    from pathlib import Path
 
     env_root = os.environ.get("FORAGE_MB_ROOT")
     if env_root:
         return env_root
-    for cand in (
-        "/root/code/memory-bridge",
-        r"C:\Users\45140\Desktop\code\memory-bridge",
-    ):
+    # 先找与 forage 仓库同级的 memory-bridge —— clone 下来最常见的布局，
+    # 作者本机和陌生人都适用，不写死任何人的家目录。
+    sibling = Path(__file__).resolve().parents[2] / "memory-bridge"
+    for cand in (str(sibling), "/root/code/memory-bridge"):
         if os.path.isdir(cand):
             return cand
-    return "/root/code/memory-bridge"
+    return str(sibling)
 
 
 MB_ROOT = _default_mb_root()

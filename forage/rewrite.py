@@ -61,9 +61,11 @@ def _default_secrets() -> str:
         os.path.expanduser("~/.forage/secrets.env"),
         os.path.join(local, "hermes", "secrets", "siliconflow.env"),
     ]
-    candidates += sorted(
-        glob.glob("/mnt/c/Users/*/AppData/Local/hermes/secrets/siliconflow.env")
-    )
+    # WSL 里 Windows 侧的凭据目录挂载在 /mnt/c；只在它确实存在时才找。
+    if os.path.isdir("/mnt/c/Users"):
+        candidates += sorted(
+            glob.glob("/mnt/c/Users/*/AppData/Local/hermes/secrets/siliconflow.env")
+        )
     for c in candidates:
         if c and os.path.exists(c):
             return c
