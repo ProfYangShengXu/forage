@@ -6,6 +6,8 @@ description: "开发决策类问题（选型/架构取舍/依赖版本/踩坑）
 # forage · 本地技术博客检索
 
 把技术博客抓进 SQLite(FTS5)，供**开发决策**时检索证据。
+
+> ⚠️ **检索层正在重做**：将改为复用 [memory-bridge](https://github.com/ProfYangShengXu/memory-bridge) 的混合检索（BM25+jieba / 向量 / RRF / 精排 / 父子块 / pgvector），forage 只保留【技术文档爬虫】与【改写召回】两块。下面描述的是当前版本的行为。
 **它是检索层，不是问答层** —— 它负责把相关段落找出来，判断交给调用方。
 
 ## 第 0 步：先确认库能用（不要假设）
