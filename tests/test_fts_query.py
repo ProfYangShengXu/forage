@@ -27,7 +27,7 @@ def test_pure_cjk_single_phrase():
 
 
 def test_relaxed_route_is_appended_not_replacing():
-    """★ 口径来自 AIE3672 tut4 A1 节点：改写/放宽是【加一路】不是【换掉】。
+    """★ 口径来自 Advanced RAG 的 query rewriting：放宽是【加一路】不是【换掉】。
 
     精确路优先召回，放宽路在后兜底 —— 不是二选一的替换关系。
     """

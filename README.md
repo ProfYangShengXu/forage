@@ -141,9 +141,9 @@ cp .env.example .env      # 填 BASE_URL / API_KEY / MODEL
 ```
 
 ```
-CSKB_REWRITE_BASE_URL=https://api.siliconflow.cn
-CSKB_REWRITE_API_KEY=sk-xxxx
-CSKB_REWRITE_MODEL=Qwen/Qwen3-8B
+FORAGE_REWRITE_BASE_URL=https://api.siliconflow.cn
+FORAGE_REWRITE_API_KEY=sk-xxxx
+FORAGE_REWRITE_MODEL=Qwen/Qwen3-8B
 ```
 
 > **fail-open 是硬约定**：改写后端挂了、超时了、返回垃圾，都只降级成"只跑原查询"，
@@ -294,7 +294,7 @@ CoolShell · draveness(面向信仰编程) · piglei · Jimmy Song · Python猫
 | 改完代码不生效 | `__pycache__` 里的旧 `.pyc` | 删掉 `__pycache__/`；入口已设 `sys.dont_write_bytecode`（见下） |
 | 某源抓取 `ok` 数远小于条目数 | feed 的 `<link>` 全指向同一页面 | 看是不是 URL 重复 —— **`skip` 和 `fail` 是两回事** |
 | 某源入库但内容很短 | robots 禁抓 → 退化成 feed 摘要 | 查 `avg(words)`，低于 800 就该弃用该源 |
-| 换台机器跑不起来 | 写死了本机路径 | 用 `CSKB_DB` / `CSKB_SECRETS` 覆盖 |
+| 换台机器跑不起来 | 写死了本机路径 | 用 `FORAGE_DB` / `FORAGE_SECRETS` 覆盖 |
 
 **源健康度体检**（加源后必跑）：
 
@@ -364,9 +364,9 @@ mkdir -p ~/.dsh/skills/forage && cp SKILL.md ~/.dsh/skills/forage/
 
 这个项目的检索链路不是凭空设计的，**每一步都对应一个学过的失败模式**：
 
-- **查询改写 / 词汇鸿沟 / 「加一路不换掉」** —— AIE3672 tut4 A1 节点（Advanced RAG）
-- **实体消解 / 关系收敛 / 图谱成本** —— 同课程 B1 节点；图谱那部分的成本判断直接来自这里
-- **召回前过滤（权限/版本/时效）** —— 上下文工程 lec12 口径
+- **查询改写 / 词汇鸿沟 / 「加一路不换掉」** —— Advanced RAG 的 query rewriting 一节
+- **实体消解 / 关系收敛 / 图谱建图成本** —— GraphRAG / KG 构建；图谱的成本判断（每 chunk 一次 LLM 调用）直接来自这里
+- **召回前过滤（权限/版本/时效）** —— 过滤必须发生在排序之前，否则等于没过滤
 - **来源合规（只走官方 feed、robots 检查、拒绝静默退化）** —— 抓取层的基本纪律
 - **RRF / MMR** —— RRF 出自 Cormack et al. 2009；MMR 出自 Carbonell & Goldstein 1998（原用于推荐系统，本仓复用的是同一个问题：**防止同源内容占满 top-K**）
 

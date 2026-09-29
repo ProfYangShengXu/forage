@@ -1,6 +1,6 @@
-"""forage · 查询改写层（AIE3672 tut4 A1 的落地）
+"""forage · 查询改写层
 
-口径（来自 A1 节点）：
+口径（Advanced RAG 的 query rewriting）：
   ★ 改写是「加一路」不是「换掉」 —— 原 query 必留（技术博客里 useEffect /
     pg_advisory_lock / v18.2 全是精确串，改写会倾向泛化把它们抹掉）
   ★ 判据：用文档自己的措辞搜排得进来吗？排不进来 = 词汇鸿沟 → 改写
@@ -19,15 +19,36 @@ CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 
+def _env(*names, default=None):
+    """按顺序读第一个有值的环境变量（兼顾旧前缀 FORAGE_ / CSKB_）。"""
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return default
+
+
 def _default_secrets():
-    """默认去 Hermes 的 secrets 目录找（作者本机约定）；陌生机器用 CSKB_SECRETS 覆盖。"""
-    import os as _os
-    base = _os.environ.get("LOCALAPPDATA") or _os.path.expanduser("~")
-    return _os.path.join(base, "hermes", "secrets", "siliconflow.env")
+    """找一个凭据文件。优先环境变量，其次几个常见位置。
+
+    ★ 不在代码里写死任何人的家目录 —— 找不到就返回中性默认，
+      调用方据此降级成"只跑原查询"，检索本身不受影响。
+    """
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    candidates = [
+        _env("FORAGE_SECRETS", "CSKB_SECRETS", default=""),
+        os.path.expanduser("~/.config/forage/secrets.env"),
+        os.path.expanduser("~/.forage/secrets.env"),
+        os.path.join(local, "hermes", "secrets", "siliconflow.env"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return candidates[1]
 
 
 # ★ 不在代码里写死任何人的家目录 —— 环境变量优先，找不到就退化成"无改写真跑"。
-SECRETS = os.environ.get("CSKB_SECRETS") or _default_secrets()
+SECRETS = _default_secrets()
 
 SYS_PROMPT = (
     "你是技术检索的查询改写器。把用户的中文技术查询改写成【英文检索关键词】。"
@@ -71,9 +92,17 @@ class Rewriter:
         self.timeout = timeout
         self.verbose = verbose
         self.env = _load_env()
-        self.base = (self.env.get("SILICONFLOW_BASE_URL") or "").rstrip("/")
-        self.key = self.env.get("SILICONFLOW_API_KEY") or ""
-        self.model = self.env.get("SILICONFLOW_MODEL") or "Qwen/Qwen3-8B"
+        # ★ 环境变量优先，其次 secrets 文件里的键 —— 两条路都通，
+        #   免得文档写了一套名字、代码读另一套（那等于文档里的配置项不存在）。
+        self.base = (_env("FORAGE_REWRITE_BASE_URL", "SILICONFLOW_BASE_URL")
+                     or self.env.get("FORAGE_REWRITE_BASE_URL")
+                     or self.env.get("SILICONFLOW_BASE_URL") or "").rstrip("/")
+        self.key = (_env("FORAGE_REWRITE_API_KEY", "SILICONFLOW_API_KEY")
+                    or self.env.get("FORAGE_REWRITE_API_KEY")
+                    or self.env.get("SILICONFLOW_API_KEY") or "")
+        self.model = (_env("FORAGE_REWRITE_MODEL", "SILICONFLOW_MODEL")
+                      or self.env.get("FORAGE_REWRITE_MODEL")
+                      or self.env.get("SILICONFLOW_MODEL") or "Qwen/Qwen3-8B")
         self.n_calls = 0
         self.n_cache = 0
         if conn is not None:
