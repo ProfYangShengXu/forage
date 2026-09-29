@@ -362,7 +362,17 @@ mkdir -p ~/.dsh/skills/forage && cp SKILL.md ~/.dsh/skills/forage/
 
 ## 设计出处
 
-这个项目的检索链路不是凭空设计的，**每一步都对应一个学过的失败模式**：
+**注入策略参考 [memory-bridge](https://github.com/ProfYangShengXu/memory-bridge)** —— 它解决的是
+「单个 agent 怎么才真的记住东西」（什么时候、把什么塞进 prompt），与本项目的检索链路正交，
+但决定了三处设计：
+
+| memory-bridge 的决策 | 在本项目的落地 |
+|---|---|
+| **常驻 > 检索** | `db.decisions` 表 —— 结论进常驻记忆，**完整版 + 证据引用留库**（记忆放得下结论，放不下证据） |
+| **确定性触发 > 模型自主** | **[`SKILL.md`](SKILL.md) 里写死触发词** —— 不赌模型自己想起来查，这是 SKILL.md 存在的理由 |
+| **可变内容只放 prompt 末尾** | SKILL.md 的「别做的事」—— 检索结果当尾部附件，不写进常驻记忆（否则每次都让缓存失效） |
+
+**检索链路本身**不是凭空设计的，每一步都对应一个具体的失败模式：
 
 - **查询改写 / 词汇鸿沟 / 「加一路不换掉」** —— Advanced RAG 的 query rewriting 一节
 - **实体消解 / 关系收敛 / 图谱建图成本** —— GraphRAG / KG 构建；图谱的成本判断（每 chunk 一次 LLM 调用）直接来自这里

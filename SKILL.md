@@ -29,7 +29,7 @@ forage stats 2>/dev/null || python -m forage stats
 
 ## 什么时候必须查
 
-**确定性触发 > 模型自主** —— 不要赌自己会想起来查：
+**确定性触发 > 模型自主**（策略出自 [memory-bridge](https://github.com/ProfYangShengXu/memory-bridge)）—— 不要赌自己会想起来查：
 
 ```
 命中以下话题 → 先跑 forage search，再基于结果回答：

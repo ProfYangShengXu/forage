@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS ingest_log (
     at            TEXT NOT NULL
 );
 
--- 决策记录（Hermes memory 放结论，这里放结论的完整版+证据引用）
+-- 决策记录：结论进常驻记忆（几百字节够用），完整版 + 证据引用留在这里。
+-- ★ 这是「常驻 > 检索」的落地 —— 记忆放得下结论，放不下证据。
 CREATE TABLE IF NOT EXISTS decisions (
     id            INTEGER PRIMARY KEY,
     topic         TEXT NOT NULL,
