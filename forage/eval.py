@@ -1,225 +1,329 @@
-"""forage · 评测层
+"""forage · 评测：量化「改写 vs 不改写」的 Recall / MRR / NDCG。
 
-★ 为什么必须先做：没有数字，"改写/MMR/multi-query 有没有用"只能靠肉眼看。
+和旧版的关键差异：
+  · 旧版在评测时才调 LLM 生成 query（每次跑结果都在变，且依赖后端在线）。
+    新版**只生成一次并冻结**到 ``forage/eval_set.json``；
+    之后评测是确定性的，不调 LLM，可反复复现。
+  · 相关判定按 ``source_doc``（整篇文档级），每 query 1 篇相关 → Recall@k 等价 Hit@k。
 
-评测集构造（自动 + 可判定，避免人工标注的不可复现）：
-  从库里采样文章 → LLM 把它改写成【用户真会输入的中文查询】（不是照抄标题）
-  → ground truth = 那篇文章的 doc_id，天然已知
-  → 指标用确定性公式（Recall/MRR/NDCG），不再调 LLM 判定 = 无循环论证
+指标（二值相关性）::
 
-指标口径（lec11）：
-  Recall@K  分母=全部相关文档；本任务每 query 1 篇相关 → 等价 Hit@K
-  MRR@K     只看第一篇相关的位置
-  NDCG@K    二值相关性下的排序质量
-★ 单相关文档的评测集偏"能不能找到"，测不出"排序好不好" —— 另加决策型
-  query（多篇都可能相关），用宽松判定（看主题命中）。
+    Recall@k = 命中 query 数 / 总 query 数
+    MRR@k    = mean( 1 / 第一篇相关的名次 )
+    NDCG@k   = DCG(二值 rels) / IDCG(1 篇相关)
+
+用法::
+
+    forage eval --build          # 采样文档 → LLM 生成中文 query → 冻结 JSON
+    forage eval                  # 跑改写版
+    forage eval --no-rewrite     # 跑裸查版
+    forage eval --weights 1.0,0.45,0.45,0.45,0.45   # 调参对照
 """
-import json, time, random, re, math
 
-QUERY_SCHEMA = """
-CREATE TABLE IF NOT EXISTS eval_queries (
-    id         INTEGER PRIMARY KEY,
-    query      TEXT NOT NULL,
-    kind       TEXT,            -- fact / decision
-    gt_doc     INTEGER,         -- fact 类: 目标文档 id
-    gt_topic   TEXT,            -- decision 类: 主题关键词（宽松判定用）
-    src_title  TEXT,
-    created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS eval_runs (
-    id         INTEGER PRIMARY KEY,
-    tag        TEXT,            -- 本次跑法的标记，如 "rewrite=on,max_routes=4"
-    k          INTEGER,
-    n_queries  INTEGER,
-    recall     REAL,
-    mrr        REAL,
-    ndcg       REAL,
-    diversity  REAL,          -- top-K 里不同文章的占比（测 MMR）
-    secs       REAL,
-    detail     TEXT,            -- JSON: 每 query 的明细
-    at         TEXT
-);
-"""
+from __future__ import annotations
+
+import json
+import math
+import re
+import time
+from pathlib import Path
+
+DEFAULT_SET = Path(__file__).resolve().parent / "eval_set.json"
 
 GEN_PROMPT = (
     "下面是一篇技术博客的标题和开头。请生成一个【真实用户会敲进搜索框的中文查询词】，"
     "用来找到这篇文章。\n"
     "要求：\n"
     "1. 不要照抄标题，用用户自己的说法（可以口语化、可以不准，就像他真的不懂时那样问）\n"
-    "2. 长度 4-20 字\n"
+    "2. 长度 4-20 字，必须含中文\n"
     "3. 只输出查询词本身，不要引号、不要解释\n"
     "标题：{title}\n"
     "开头：{lead}"
 )
 
-
-# ---------------------------------------------------------------- 构造
-def build_set(conn, n_fact=30, n_decision=12, seed=42, verbose=True, rewriter=None):
-    """生成评测集。fact 类由文章反向生成 query（GT 明确）；decision 类内置。"""
-    from .rewrite import Rewriter
-    conn.executescript(QUERY_SCHEMA)
-    conn.commit()
-    conn.execute("DELETE FROM eval_queries")
-    conn.commit()
-
-    rw = rewriter or Rewriter(conn)
-    if not rw.enabled:
-        raise RuntimeError("改写后端不可用，无法生成评测集")
-
-    random.seed(seed)
-    # ★ 分层采样：每个源抽 1-2 篇，保证覆盖各源
-    docs = []
-    for src in [r[0] for r in conn.execute("SELECT DISTINCT source FROM docs")]:
-        rows = conn.execute(
-            "SELECT id, title, source, lang FROM docs WHERE source=? AND words>1500 ORDER BY RANDOM() LIMIT 2",
-            (src,)).fetchall()
-        docs.extend([dict(r) for r in rows])
-    random.shuffle(docs)
-    docs = docs[:n_fact]
-
-    made = []
-    # ★ 剔除不适合做评测样本的文章（"评测集本身有问题"会低估真实性能）
-    BAD_TITLE = re.compile(
-        r"(sponsored|advertisement|weekly\s+(issue|roundup)|roundup|newsletter|"
-        r"monthly\s+update|links?\s+for\s+the\s+week|this week in|digest|"
-        r"we(’|')?re hiring|job posting|announcing\s+our\s+pricing)", re.I)
-
-    for i, d in enumerate(docs, 1):
-        if BAD_TITLE.search(d["title"] or "") or len(d["title"] or "") < 12:
-            if verbose:
-                print("  [%2d/%d] 跳过噪声样本: %s" % (i, len(docs), (d["title"] or "")[:44]))
-            continue
-        lead = conn.execute("SELECT text FROM chunks WHERE doc_id=? ORDER BY idx LIMIT 1",
-                            (d["id"],)).fetchone()
-        lead = (lead[0][:400] if lead else "")
-        try:
-            import urllib.request, ssl
-            body = json.dumps({
-                "model": rw.model,
-                "messages": [{"role": "system", "content": "你是技术检索测试集生成器，只输出查询词。"},
-                             {"role": "user", "content": GEN_PROMPT.format(title=d["title"][:120], lead=lead)}],
-                "max_tokens": 60, "temperature": 0.6, "enable_thinking": False,
-            }).encode()
-            req = urllib.request.Request(rw.base + "/v1/chat/completions", data=body,
-                                         headers={"Authorization": "Bearer " + rw.key,
-                                                  "Content-Type": "application/json"})
-            ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, timeout=40, context=ctx) as r:
-                q = json.loads(r.read().decode())["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            if verbose: print("  生成失败:", str(e)[:60])
-            continue
-        q = re.sub(r"^[\"'「『]|[\"'」』]$", "", q).strip()
-        if not (3 <= len(q) <= 40):
-            continue
-        conn.execute("INSERT INTO eval_queries (query,kind,gt_doc,gt_topic,src_title,created_at) "
-                     "VALUES (?,?,?,?,?,?)",
-                     (q, "fact", d["id"], None, d["title"][:120], time.strftime("%F %T")))
-        made.append(q)
-        if verbose:
-            print("  [%2d/%d] %-10s 「%s」 ← %s" % (
-                i, len(docs), d["source"], q[:34], d["title"][:38]))
-
-    # decision 类：多篇可能相关，用主题关键词宽松判定
-    DECISIONS = [
-        ("该用 PostgreSQL 还是 MySQL",        ["postgres", "mysql", "database", "数据库"]),
-        ("消息队列 Kafka 还是 RabbitMQ",       ["kafka", "rabbitmq", "message", "消息"]),
-        ("单体还是微服务怎么选",                ["microservice", "monolith", "微服务", "架构"]),
-        ("什么时候该加缓存",                   ["cache", "缓存", "redis"]),
-        ("容器编排选 Kubernetes 还是简单点",     ["kubernetes", "k8s", "container", "容器"]),
-        ("服务拆分粒度怎么定",                  ["service", "微服务", "拆分", "boundary"]),
-        ("数据库索引建多了会怎样",              ["index", "索引", "query performance"]),
-        ("分布式事务怎么保证一致性",             ["transaction", "consistency", "事务", "consistency"]),
-        ("怎么排查线上性能问题",                ["performance", "latency", "性能", "profiling"]),
-        ("日志和监控该怎么做",                  ["observability", "logging", "monitoring", "可观测"]),
-        ("RAG 召回不准怎么调",                 ["rag", "retrieval", "recall", "召回"]),
-        ("Agent 长任务怎么保证不跑偏",          ["agent", "planning", "long-horizon", "任务"]),
-    ]
-    for q, topics in DECISIONS[:n_decision]:
-        conn.execute("INSERT INTO eval_queries (query,kind,gt_doc,gt_topic,src_title,created_at) "
-                     "VALUES (?,?,?,?,?,?)",
-                     (q, "decision", None, json.dumps(topics, ensure_ascii=False), "-", time.strftime("%F %T")))
-    conn.commit()
-    if verbose:
-        print()
-        print("  生成 %d 条 fact + %d 条 decision" % (len(made), min(len(DECISIONS), n_decision)))
-    return len(made), min(len(DECISIONS), n_decision)
+# 评测集不采样的噪声文档（周刊/release notes/招聘/颁奖/会议通知）
+BAD_TITLE = re.compile(
+    r"(sponsored|advertisement|weekly\s+(issue|roundup)|roundup|newsletter|"
+    r"monthly\s+update|links?\s+for\s+the\s+week|this week in|digest|"
+    r"we(’|')?re hiring|job posting|announcing\s+our\s+pricing|"
+    r"released|release notes|award|seminar|partnership|office hours|"
+    r"video|alumni|resume|prison program)",
+    re.I,
+)
 
 
-# ---------------------------------------------------------------- 指标
-def _dcg(rels):
+# ------------------------------------------------------------------ 指标
+def _dcg(rels: list[int]) -> float:
     return sum((2 ** r - 1) / math.log2(i + 2) for i, r in enumerate(rels))
 
 
-def _ndcg(rels, n_rel):
+def _ndcg(rels: list[int], n_rel: int) -> float:
     ideal = _dcg([1] * n_rel + [0] * max(0, len(rels) - n_rel))
     return (_dcg(rels) / ideal) if ideal > 0 else 0.0
 
 
-def run_eval(conn, k=10, tag="default", do_rewrite=True, verbose=True, **kw):
-    """跑评测，返回指标 dict 并落库。"""
-    from .search import search, search_multi
-    conn.executescript(QUERY_SCHEMA)
-    conn.commit()
+def load_set(path: Path | str = DEFAULT_SET) -> dict:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"评测集不存在：{path}（先跑 forage eval --build）")
+    return json.loads(path.read_text(encoding="utf-8"))
 
-    qs = [dict(r) for r in conn.execute("SELECT * FROM eval_queries ORDER BY id")]
-    if not qs:
-        raise RuntimeError("评测集为空，先跑 build_set()")
 
-    detail, n_fact = [], 0
-    hit_sum = mrr_sum = ndcg_sum = div_sum = 0.0
+def _search_kwargs(
+    weights: list[float] | None,
+    dampen_original: float | None,
+    rewrite_weight: float | None,
+    share_budget: bool,
+    rewrite_budget: float | None,
+) -> dict:
+    """只把显式给出的参数传进 search，避免用 None 覆盖掉模块默认值。"""
+    kwargs: dict = {"weights": weights, "dampen_original": dampen_original}
+    if rewrite_weight is not None:
+        kwargs["rewrite_weight"] = rewrite_weight
+        kwargs["share_budget"] = False
+    if not share_budget:
+        kwargs["share_budget"] = False
+    if rewrite_budget is not None:
+        kwargs["rewrite_budget"] = rewrite_budget
+    return kwargs
+
+
+def evaluate(
+    eval_set: dict,
+    *,
+    k: int = 10,
+    rewrite: bool = True,
+    weights: list[float] | None = None,
+    dampen_original: float | None = None,
+    rewrite_weight: float | None = None,
+    share_budget: bool = True,
+    rewrite_budget: float | None = None,
+    verbose: bool = True,
+) -> dict:
+    """跑一遍评测。返回指标 dict（含 per-query 明细）。"""
+    from .recall import search
+
+    queries = eval_set.get("queries", [])
+    if not queries:
+        raise ValueError("评测集为空")
+
+    detail: list[dict] = []
+    hit_sum = mrr_sum = ndcg_sum = 0.0
     t0 = time.time()
+    kw = _search_kwargs(weights, dampen_original, rewrite_weight, share_budget, rewrite_budget)
+    for entry in queries:
+        result = search(
+            entry["query"],
+            k=k,
+            rewrite=rewrite,
+            verbose=False,
+            **kw,
+        )
+        hit_docs = list(result.hits)
+        # ★ 按 source_doc 去重：一篇文档有多个父块，同一篇文章命中两次会把
+        #   NDCG 的二值理想值算爆（>1）。文档级相关性只认「首次出现」。
+        doc_order: list[str] = []
+        for h in hit_docs:
+            if h.doc.source_doc not in doc_order:
+                doc_order.append(h.doc.source_doc)
+        rels = [1 if sd == entry["source_doc"] else 0 for sd in doc_order]
+        hit = 1 if any(rels) else 0
+        rank = (rels.index(1) + 1) if hit else 0
+        hit_sum += hit
+        mrr_sum += (1.0 / rank) if rank else 0.0
+        ndcg_sum += _ndcg(rels, 1)
+        detail.append(
+            {
+                "query": entry["query"],
+                "gt": entry["source_doc"],
+                "gt_title": entry.get("title", ""),
+                "hit": hit,
+                "rank": rank,
+                "variants": result.variants,
+                "got": [h.doc.source_doc for h in hit_docs[:k]],
+            }
+        )
 
-    # ★ 只有 search_multi 支持的参数才往下传；裸查走 search()
-    MULTI_KEYS = {"max_routes", "rewrite_weight", "do_mmr", "mmr_lambda",
-                  "do_multiquery", "mq_routes", "mq_weight"}
-
-    for q in qs:
-        if do_rewrite:
-            rows = search_multi(conn, q["query"], k=k, do_rewrite=True, **kw)
-        else:
-            plain = {kk: vv for kk, vv in kw.items() if kk not in MULTI_KEYS}
-            rows = search(conn, q["query"], k=k, **plain)
-
-        # ★ 多样性：top-K 里【不同文章】的占比（1.0 = 每篇都不一样）
-        #   MMR 的收益在这个指标上才看得见，"单相关文档"的 Recall 测不出来
-        n_uniq = len({r["source_root"] for r in rows})
-        div = (n_uniq / len(rows)) if rows else 0.0
-        div_sum += div
-
-        if q["kind"] == "fact":
-            n_fact += 1
-            rels = [1 if r["doc_id"] == q["gt_doc"] else 0 for r in rows]
-            hit = 1 if any(rels) else 0
-            rank = (rels.index(1) + 1) if hit else 0
-            hit_sum += hit
-            mrr_sum += (1.0 / rank) if rank else 0.0
-            ndcg_sum += _ndcg(rels, 1)
-            detail.append({"q": q["query"], "kind": "fact", "hit": hit, "rank": rank,
-                           "gt": q["src_title"][:60],
-                           "got": [r["title"][:50] for r in rows[:3]]})
-        else:
-            topics = json.loads(q["gt_topic"] or "[]")
-            blob = " ".join(((r["title"] or "") + " " + (r["heading"] or "") + " " + r["text"][:400]).lower()
-                            for r in rows[:k])
-            hit = 1 if any(t.lower() in blob for t in topics) else 0
-            hit_sum += hit
-            mrr_sum += hit
-            ndcg_sum += hit
-            detail.append({"q": q["query"], "kind": "decision", "hit": hit,
-                           "got": [r["title"][:50] for r in rows[:3]]})
-
-    n = len(qs)
-    dt = time.time() - t0
-    res = {"tag": tag, "k": k, "n_queries": n, "n_fact": n_fact,
-           "recall": hit_sum / n, "mrr": mrr_sum / n, "ndcg": ndcg_sum / n,
-           "diversity": div_sum / n, "secs": dt}
-    conn.execute("INSERT INTO eval_runs (tag,k,n_queries,recall,mrr,ndcg,diversity,secs,detail,at) "
-                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                 (tag, k, n, res["recall"], res["mrr"], res["ndcg"], res["diversity"], dt,
-                  json.dumps(detail, ensure_ascii=False), time.strftime("%F %T")))
-    conn.commit()
+    n = len(queries)
+    report = {
+        "k": k,
+        "n": n,
+        "rewrite": rewrite,
+        "weights": weights,
+        "recall": hit_sum / n,
+        "mrr": mrr_sum / n,
+        "ndcg": ndcg_sum / n,
+        "secs": time.time() - t0,
+        "detail": detail,
+    }
     if verbose:
-        print("  [%s] n=%d  Recall@%d=%.3f  MRR@%d=%.3f  NDCG@%d=%.3f  Div@%d=%.3f  (%.1fs)" % (
-            tag, n, k, res["recall"], k, res["mrr"], k, res["ndcg"], k, res["diversity"], dt))
-    return res
+        print(
+            f"  rewrite={'on ' if rewrite else 'off'} n={n}  "
+            f"Recall@{k}={report['recall']:.3f}  MRR@{k}={report['mrr']:.3f}  "
+            f"NDCG@{k}={report['ndcg']:.3f}  ({report['secs']:.1f}s)"
+        )
+    return report
+
+
+def retention(
+    eval_set: dict,
+    *,
+    k_top: int = 5,
+    weights: list[float] | None = None,
+    dampen_original: float | None = None,
+    rewrite_weight: float | None = None,
+    share_budget: bool = True,
+    rewrite_budget: float | None = None,
+    verbose: bool = True,
+) -> dict:
+    """原 query top5 保留率 —— 回答「改写有没有把原 query 独有命中挤出去」。
+
+    · ``top5_retention``：裸查 top5 里有多少仍在带改写的 top5（整体口径）
+    · ``original_only_retention``：★ 更严格 —— 只统计「只被原 query 命中、
+      任何改写路都没命中」的文档，这类文档被挤出才是真的丢失原 query 情报
+    · ``rewrite_only_per_query``：带改写 top5 中，原 query 路完全没召回的条数
+    """
+    from .recall import search
+
+    entries = eval_set.get("queries", [])
+    if not entries:
+        raise ValueError("评测集为空")
+
+    baseline: dict[str, list[str]] = {}
+    for entry in entries:
+        r = search(entry["query"], k=k_top, rewrite=False, verbose=False)
+        baseline[entry["query"]] = [h.doc.id for h in r.hits]
+
+    top5_sum = 0.0
+    only_num = only_den = 0
+    added = 0.0
+    kw = _search_kwargs(weights, dampen_original, rewrite_weight, share_budget, rewrite_budget)
+    for entry in entries:
+        r = search(entry["query"], k=k_top, rewrite=True, verbose=False, **kw)
+        top = [h.doc.id for h in r.hits]
+        base5 = baseline[entry["query"]]
+        top5_sum += len(set(base5) & set(top)) / max(k_top, 1)
+        added += sum(1 for h in r.hits if 0 not in r.route_ranks_all.get(h.doc.id, {}))
+        only = [d for d in base5 if set(r.route_ranks_all.get(d, {}).keys()) <= {0}]
+        only_den += len(only)
+        only_num += len(set(only) & set(top))
+
+    n = len(entries)
+    report = {
+        "k": k_top,
+        "n": n,
+        "top5_retention": top5_sum / n,
+        "original_only_retention": (only_num / only_den) if only_den else 1.0,
+        "original_only_slots": only_den,
+        "rewrite_only_per_query": added / n,
+    }
+    if verbose:
+        print(
+            f"  保留率@{k_top}（n={n}）：整体 top{k_top} 保留={report['top5_retention']:.3f}  "
+            f"原query独有保留={report['original_only_retention']:.3f}"
+            f"（{only_den} 个独有槽位）  改写独有={report['rewrite_only_per_query']:.2f}/query"
+        )
+    return report
+
+
+# ------------------------------------------------------------------ 构造评测集
+def _sample_docs(limit: int = 18, *, max_per_host: int = 2, min_chars: int = 1500) -> list[dict]:
+    """从 techblog 采样文档：每个 host 最多 max_per_host 篇，取长文。
+
+    ``lead`` 取该文档前几个父块拼起来（前 800 字）—— 只看第一个父块往往只有
+    一行标题，会把短引子的长文全滤掉。
+    """
+    from .bridge import COLLECTION, get_pipeline
+
+    pipe = get_pipeline()
+    with pipe.store.engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT source_doc, chunk_index, text, section FROM chunks "
+            "WHERE collection = %s AND is_parent ORDER BY source_doc, chunk_index",
+            (COLLECTION,),
+        ).fetchall()
+
+    docs: dict[str, dict] = {}
+    for source_doc, _idx, text, section in rows:
+        doc = docs.setdefault(
+            str(source_doc), {"source_doc": str(source_doc), "chars": 0, "title": "", "lead": ""}
+        )
+        doc["chars"] += len(text or "")
+        if not doc["title"] and section:
+            doc["title"] = str(section)
+        lead_parts = doc.get("_lead_parts") or []
+        if sum(len(p) for p in lead_parts) < 800:
+            lead_parts.append(" ".join((text or "").split()))
+            doc["_lead_parts"] = lead_parts
+    for doc in docs.values():
+        doc["lead"] = " ".join(doc.pop("_lead_parts", []))[:800]
+
+
+    host_count: dict[str, int] = {}
+    picked: list[dict] = []
+    for doc in sorted(docs.values(), key=lambda d: -d["chars"]):
+        if doc["chars"] < min_chars or len(doc["lead"]) < 200:
+            continue
+        if BAD_TITLE.search(doc["title"] or ""):
+            continue
+        host = doc["source_doc"].split("/")[2] if "//" in doc["source_doc"] else doc["source_doc"]
+        if host_count.get(host, 0) >= max_per_host:
+            continue
+        host_count[host] = host_count.get(host, 0) + 1
+        picked.append(doc)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def build_set(
+    *,
+    limit: int = 18,
+    out_path: Path | str = DEFAULT_SET,
+    verbose: bool = True,
+) -> dict:
+    """采样 → LLM 生成中文 query → 冻结 JSON。**只在建集时调 LLM。**"""
+    from .rewrite import Rewriter
+
+    rewriter = Rewriter(verbose=False)
+    if not rewriter.enabled:
+        raise RuntimeError("改写后端不可用，无法生成评测集")
+
+    docs = _sample_docs(limit)
+    entries: list[dict] = []
+    for i, doc in enumerate(docs, 1):
+        prompt = GEN_PROMPT.format(title=doc["title"][:120], lead=doc["lead"])
+        try:
+            raw = rewriter.chat("你是技术检索测试集生成器，只输出查询词。", prompt,
+                                max_tokens=60, temperature=0.6)
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                print(f"  [{i}/{len(docs)}] 生成失败：{str(exc)[:60]}")
+            continue
+        query = re.sub(r"^[\"'「『]|[\"'」』]$", "", raw.strip()).strip()
+        query = query.splitlines()[0].strip() if query else ""
+        if not (4 <= len(query) <= 30) or not re.search(r"[\u4e00-\u9fff]", query):
+            if verbose:
+                print(f"  [{i}/{len(docs)}] 丢弃不合格 query：{query[:40]!r}")
+            continue
+        entries.append(
+            {
+                "query": query,
+                "source_doc": doc["source_doc"],
+                "title": doc["title"][:120],
+                "chars": doc["chars"],
+            }
+        )
+        if verbose:
+            print(f"  [{i}/{len(docs)}] 「{query}」 ← {doc['title'][:44]}")
+
+    payload = {
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model": rewriter.model,
+        "n": len(entries),
+        "queries": entries,
+    }
+    Path(out_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if verbose:
+        print(f"\n冻结 {len(entries)} 条到 {out_path}")
+    return payload

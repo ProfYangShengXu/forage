@@ -1,23 +1,41 @@
-"""forage · 查询改写层
+"""forage · 查询改写层（搬自旧版，删掉里面的检索逻辑）。
 
-口径（Advanced RAG 的 query rewriting）：
+职责只剩一件事：中文 query → 3-5 组英文关键词（OpenAI 兼容 /chat/completions）。
+
+口径：
   ★ 改写是「加一路」不是「换掉」 —— 原 query 必留（技术博客里 useEffect /
     pg_advisory_lock / v18.2 全是精确串，改写会倾向泛化把它们抹掉）
-  ★ 判据：用文档自己的措辞搜排得进来吗？排不进来 = 词汇鸿沟 → 改写
-     本库实测：20 个源里 15 个英文，中文查「数据库选型」0 命中、
-     英文查 "database selection" 全中 → 典型词汇鸿沟
-  ★ fail-open：改写后端挂了就只跑原 query，绝不让检索失败（PowerContext 口径）
+  ★ fail-open：改写后端挂了/超时/返回垃圾 → 返回 []，绝不让检索失败
+  ★ 结果落 SQLite 缓存，同一个 query 只调一次
+  ★ enable_thinking=false（旧版实测：17s → ~1.1s）
 
-设计：LLM 改写的成本/延迟很高（实测 17s），所以
-  ① 结果落 SQLite 缓存，同一个 query 只调一次
-  ② enable_thinking=false 关掉思考链
-  ③ 失败静默降级
+★ 与旧版的关键差异：旧的 RRF / MMR / multi_query 全部删除（检索与融合
+  已经归 memory-bridge + forage/recall.py），这里只保留「生成改写词」。
 """
-import os, json, ssl, time, hashlib, urllib.request, re
 
+from __future__ import annotations
+
+import glob
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import ssl
+import time
+import urllib.request
+from pathlib import Path
+
+# ⚠️ 沿用旧版的 TLS 设置，兼容自签/链不全的 OpenAI 兼容端点。
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CACHE = os.environ.get("FORAGE_REWRITE_CACHE") or str(
+    _PROJECT_ROOT / ".cache" / "rewrite.sqlite"
+)
+
 
 def _env(*names, default=None):
     """按顺序读第一个有值的环境变量（兼顾旧前缀 FORAGE_ / CSKB_）。"""
@@ -28,11 +46,13 @@ def _env(*names, default=None):
     return default
 
 
-def _default_secrets():
-    """找一个凭据文件。优先环境变量，其次几个常见位置。
+def _default_secrets() -> str:
+    """找一个凭据文件。环境变量优先，其次几个常见位置。
 
     ★ 不在代码里写死任何人的家目录 —— 找不到就返回中性默认，
       调用方据此降级成"只跑原查询"，检索本身不受影响。
+    ★ 额外加了 WSL 下 Windows 侧的挂载路径（旧版只在 Windows 原生跑，
+      没这个需求）；仍然用 glob，不写死用户名。
     """
     local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     candidates = [
@@ -41,13 +61,15 @@ def _default_secrets():
         os.path.expanduser("~/.forage/secrets.env"),
         os.path.join(local, "hermes", "secrets", "siliconflow.env"),
     ]
+    candidates += sorted(
+        glob.glob("/mnt/c/Users/*/AppData/Local/hermes/secrets/siliconflow.env")
+    )
     for c in candidates:
         if c and os.path.exists(c):
             return c
     return candidates[1]
 
 
-# ★ 不在代码里写死任何人的家目录 —— 环境变量优先，找不到就退化成"无改写真跑"。
 SECRETS = _default_secrets()
 
 SYS_PROMPT = (
@@ -70,88 +92,149 @@ CREATE TABLE IF NOT EXISTS rewrite_cache (
 """
 
 
-def _load_env(path=SECRETS):
-    env = {}
+def _load_env(path: str = SECRETS) -> dict:
+    env: dict = {}
     try:
-        for ln in open(path, encoding="utf-8"):
-            ln = ln.strip()
-            if ln and not ln.startswith("#") and "=" in ln:
-                k, v = ln.split("=", 1)
-                env[k.strip()] = v.strip()
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    env[key.strip()] = value.strip()
     except Exception:
         pass
     return env
 
 
 class Rewriter:
-    """中文 → 英文查询改写（带 SQLite 缓存 + fail-open）"""
+    """中文 → 英文查询改写（SQLite 缓存 + fail-open）。"""
 
-    def __init__(self, conn=None, enabled=True, timeout=45, verbose=False):
-        self.conn = conn
+    def __init__(self, cache_path: str | None = None, enabled: bool = True,
+                 timeout: int = 45, verbose: bool = False):
         self.enabled = enabled
         self.timeout = timeout
         self.verbose = verbose
         self.env = _load_env()
         # ★ 环境变量优先，其次 secrets 文件里的键 —— 两条路都通，
         #   免得文档写了一套名字、代码读另一套（那等于文档里的配置项不存在）。
-        self.base = (_env("FORAGE_REWRITE_BASE_URL", "SILICONFLOW_BASE_URL")
-                     or self.env.get("FORAGE_REWRITE_BASE_URL")
-                     or self.env.get("SILICONFLOW_BASE_URL") or "").rstrip("/")
-        self.key = (_env("FORAGE_REWRITE_API_KEY", "SILICONFLOW_API_KEY")
-                    or self.env.get("FORAGE_REWRITE_API_KEY")
-                    or self.env.get("SILICONFLOW_API_KEY") or "")
-        self.model = (_env("FORAGE_REWRITE_MODEL", "SILICONFLOW_MODEL")
-                      or self.env.get("FORAGE_REWRITE_MODEL")
-                      or self.env.get("SILICONFLOW_MODEL") or "Qwen/Qwen3-8B")
+        self.base = (
+            _env("FORAGE_REWRITE_BASE_URL", "SILICONFLOW_BASE_URL")
+            or self.env.get("FORAGE_REWRITE_BASE_URL")
+            or self.env.get("SILICONFLOW_BASE_URL")
+            or ""
+        ).rstrip("/")
+        self.key = (
+            _env("FORAGE_REWRITE_API_KEY", "SILICONFLOW_API_KEY")
+            or self.env.get("FORAGE_REWRITE_API_KEY")
+            or self.env.get("SILICONFLOW_API_KEY")
+            or ""
+        )
+        self.model = (
+            _env("FORAGE_REWRITE_MODEL", "SILICONFLOW_MODEL")
+            or self.env.get("FORAGE_REWRITE_MODEL")
+            or self.env.get("SILICONFLOW_MODEL")
+            or "Qwen/Qwen3-8B"
+        )
         self.n_calls = 0
         self.n_cache = 0
-        if conn is not None:
-            conn.executescript(CACHE_SCHEMA)
-            conn.commit()
+        self._cache_path = cache_path or DEFAULT_CACHE
+        self._conn: sqlite3.Connection | None = None
+        if self._cache_path:
+            self._open_cache()
         if not (self.base and self.key):
             self.enabled = False
 
     # ---------------- 缓存 ----------------
-    @staticmethod
-    def _h(q):
-        return hashlib.sha1(q.strip().lower().encode("utf-8")).hexdigest()
+    def _open_cache(self) -> None:
+        try:
+            if self._cache_path != ":memory:":
+                Path(self._cache_path).parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self._cache_path, timeout=5)
+            self._conn.executescript(CACHE_SCHEMA)
+            self._conn.commit()
+        except Exception as exc:  # noqa: BLE001 - 缓存坏了不该影响检索
+            self._conn = None
+            if self.verbose:
+                print(f"  [rewrite] 缓存不可用，本次不缓存：{exc}")
 
-    def _cache_get(self, q):
-        if self.conn is None:
-            return None
-        r = self.conn.execute("SELECT variants FROM rewrite_cache WHERE qhash=?", (self._h(q),)).fetchone()
-        if not r:
+    def _h(self, q: str) -> str:
+        """缓存键 = query + base_url + model。
+
+        ★ 必须把 base/model 算进键：否则同一 query 在 A 后端上的改写会被
+          B 后端（甚至已挂掉的后端）直接复用，fail-open 永远测不到，
+          换模型后也会读到旧模型的词。
+        """
+        key = f"{q.strip().lower()}\x00{self.base}\x00{self.model}"
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+    def _cache_get(self, q: str):
+        if self._conn is None:
             return None
         try:
-            return json.loads(r[0] if isinstance(r, str) else r["variants"])
+            row = self._conn.execute(
+                "SELECT variants FROM rewrite_cache WHERE qhash=?", (self._h(q),)
+            ).fetchone()
+            return json.loads(row[0]) if row else None
         except Exception:
             return None
 
-    def _cache_put(self, q, variants):
-        if self.conn is None:
+    def _cache_put(self, q: str, variants: list) -> None:
+        if self._conn is None:
             return
-        self.conn.execute("INSERT OR REPLACE INTO rewrite_cache VALUES (?,?,?,?,?)",
-                          (self._h(q), q, json.dumps(variants, ensure_ascii=False),
-                           self.model, time.strftime("%Y-%m-%dT%H:%M:%S")))
-        self.conn.commit()
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO rewrite_cache VALUES (?,?,?,?,?)",
+                (
+                    self._h(q),
+                    q,
+                    json.dumps(variants, ensure_ascii=False),
+                    self.model,
+                    time.strftime("%Y-%m-%dT%H:%M:%S"),
+                ),
+            )
+            self._conn.commit()
+        except Exception:
+            pass
 
     # ---------------- LLM ----------------
-    def _llm(self, q):
-        body = json.dumps({
-            "model": self.model,
-            "messages": [{"role": "system", "content": SYS_PROMPT},
-                         {"role": "user", "content": q}],
-            "max_tokens": 160,
-            "temperature": 0,
-            "enable_thinking": False,      # ★ 关掉思考链，17s → 秒级
-        }).encode()
+    def chat(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 160,
+        temperature: float = 0.0,
+    ) -> str:
+        """通用 OpenAI 兼容调用（评测集生成等复用；仍走同一后端与超时）。"""
+        if not (self.base and self.key):
+            raise RuntimeError("rewrite 后端未配置（缺 base_url / api_key）")
+        body = json.dumps(
+            {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "enable_thinking": False,  # ★ 关掉思考链，17s → 秒级
+            }
+        ).encode()
         req = urllib.request.Request(
-            self.base + "/v1/chat/completions", data=body,
-            headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout, context=CTX) as r:
-            j = json.loads(r.read().decode())
+            self.base + "/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": "Bearer " + self.key,
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout, context=CTX) as resp:
+            payload = json.loads(resp.read().decode())
         self.n_calls += 1
-        return j["choices"][0]["message"]["content"]
+        return payload["choices"][0]["message"]["content"]
+
+    def _llm(self, q: str) -> str:
+        return self.chat(SYS_PROMPT, q, max_tokens=160, temperature=0)
 
     # ---------------- 对外 ----------------
     @staticmethod
@@ -159,7 +242,7 @@ class Rewriter:
         """只在查询含中文时才改写（英文查询本身就能命中英文源）。"""
         return bool(re.search(r"[\u4e00-\u9fff]", q or ""))
 
-    def rewrite(self, query: str) -> list:
+    def variants(self, query: str) -> list:
         """返回英文改写候选（不含原 query）。失败/不需要时返回 []。"""
         q = (query or "").strip()
         if not self.enabled or not q or not self._needs_rewrite(q):
@@ -172,166 +255,24 @@ class Rewriter:
 
         try:
             raw = self._llm(q)
-        except Exception as e:
+        except Exception as exc:  # noqa: BLE001 - fail-open 是硬约定
             if self.verbose:
-                print("  [rewrite] LLM 失败，降级只用原 query:", str(e)[:80])
+                print("  [rewrite] LLM 失败，降级只用原 query:", str(exc)[:80])
             return []
 
         parts = [p.strip(" -•\t\"'") for p in re.split(r"[,，\n;；]", raw) if p.strip()]
-        out = []
+        out: list = []
         for p in parts:
-            # 丢掉带解释性的长句（模型偶尔不听话）
-            if 2 <= len(p) <= 60 and not re.search(r"[\u4e00-\u9fff]", p) and p.lower() not in ("thinking",):
+            if (
+                2 <= len(p) <= 60
+                and not re.search(r"[\u4e00-\u9fff]", p)
+                and p.lower() not in ("thinking",)
+            ):
                 out.append(p)
         out = out[:5]
         if out:
             self._cache_put(q, out)
         return out
 
-
-def rrf_fuse(lists, k=60, weights=None):
-    """倒数排名融合（Reciprocal Rank Fusion）。
-
-    ★ 不看分数只看名次 —— 不同路（中文 BM25 / 英文改写 BM25）的分数不可比。
-    lists:    [ [row, row, ...], ... ]  每个 row 需含 'chunk_id'
-    weights:  [w1, w2, ...] 与 lists 等长；★ 原查询路应给高权重
-              （精确串匹配比改写路可信；改写会跑偏，给 0.5 左右）
-    返回 [row, ...] 按加权 RRF 分数降序，row 里带 'rrf' 和 'n_routes'（被几路命中）
-    """
-    n = len(lists)
-    if weights is None:
-        weights = [1.0] * n
-    score, seen, hits = {}, {}, {}
-    for w, lst in zip(weights, lists):
-        for rank, row in enumerate(lst, 1):
-            cid = row["chunk_id"]
-            score[cid] = score.get(cid, 0.0) + w * (1.0 / (k + rank))
-            hits[cid] = hits.get(cid, 0) + 1
-            if cid not in seen:
-                seen[cid] = row
-    out = sorted(seen.values(), key=lambda r: -score[r["chunk_id"]])
-    for r in out:
-        r["rrf"] = round(score[r["chunk_id"]], 6)
-        r["n_routes"] = hits[r["chunk_id"]]
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
-#  MMR：最大边际相关（从推荐系统迁移，解"同一篇多 chunk 占满 top-K"）
-# ─────────────────────────────────────────────────────────────
-
-def _trigrams(s: str) -> set:
-    """字符 3-gram 集合。中文无空格，字符级切分对中英都适用；不引第三方库。"""
-    s = re.sub(r"\s+", "", (s or "").lower())
-    if len(s) < 3:
-        return {s} if s else set()
-    return {s[i:i + 3] for i in range(len(s) - 2)}
-
-
-def _sim(a: str, b: str) -> float:
-    """Jaccard 相似度（字符 trigram）。"""
-    A, B = _trigrams(a), _trigrams(b)
-    if not A or not B:
-        return 0.0
-    return len(A & B) / len(A | B)
-
-
-def mmr_rerank(rows, k=10, lam=0.75, sim_fn=None):
-    """MMR 重排：score = λ·相关性 − (1−λ)·与已选项的最大相似度。
-
-    ★ 迁移自推荐系统（Carbonell & Goldstein 1998），解的是同一个问题：
-      "推荐十条几乎一样的" ≡ "top-5 里同一篇文章的多个 chunk"。
-    ★ 相关性用 rrf 分（归一化到 0..1），没有 rrf 时按名次倒数。
-    λ=1 退化成纯相关性排序；λ 越小越重视多样性。
-    返回重排后的 rows（新增 'mmr' 字段）。
-    """
-    if not rows:
-        return rows
-    sim_fn = sim_fn or _sim
-    rel = [r.get("rrf") or (1.0 / (60 + i + 1)) for i, r in enumerate(rows)]
-    mx = max(rel) or 1.0
-    rel = [x / mx for x in rel]
-
-    idx = list(range(len(rows)))
-    picked = []
-    while idx and len(picked) < k:
-        best, best_v = None, None
-        for i in idx:
-            if picked:
-                # ★ 同源（source_root 相同）直接判满相似度 —— 这才是真凶
-                red = max(sim_fn(rows[i]["text"], rows[j]["text"])
-                          if rows[i]["source_root"] != rows[j]["source_root"] else 1.0
-                          for j in picked)
-            else:
-                red = 0.0
-            v = lam * rel[i] - (1 - lam) * red
-            if best_v is None or v > best_v:
-                best, best_v = i, v
-        picked.append(best)
-        idx.remove(best)
-
-    out = []
-    for i in picked:
-        r = dict(rows[i])
-        r["mmr"] = round(rel[i], 4)
-        out.append(r)
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
-#  multi-query：决策型查询的多视角拆解（A1 的另一半）
-# ─────────────────────────────────────────────────────────────
-
-MQ_PROMPT = (
-    "下面是一个【技术选型/架构决策】类问题。请把它拆成 3-4 个【不同侧面】的英文检索查询，"
-    "用来从技术博客里找到决策所需的证据。\n"
-    "侧面要求（每个查询覆盖一个不同角度，不是同义改写）：\n"
-    "  · 方案 A 的优势\n  · 方案 B 的代价/坑\n  · 实际迁移或落地经验\n  · 反例或失败案例\n"
-    "要求：只输出英文查询，一行一个，不要编号、不要解释。\n"
-    "问题：{q}"
-)
-
-
-def multi_query(conn, query: str, n: int = 3, verbose: bool = False) -> list:
-    """决策型查询 → N 个不同侧面的子查询（英文）。失败返回 []。
-
-    ★ 与 rewrite() 的区别：rewrite 是 1→1 换措辞（治词汇鸿沟）；
-      multi_query 是 1→N 换视角（治覆盖不足）。A1 判据决定用哪个。
-    """
-    import urllib.request, ssl
-    rw = Rewriter(conn, verbose=verbose)
-    q = (query or "").strip()
-    if not rw.enabled or not q:
-        return []
-
-    cached = rw._cache_get("MQ::" + q)
-    if cached is not None:
-        return cached
-
-    try:
-        body = json.dumps({
-            "model": rw.model,
-            "messages": [{"role": "system", "content": "你是技术检索的查询分解器，只输出查询列表。"},
-                         {"role": "user", "content": MQ_PROMPT.format(q=q)}],
-            "max_tokens": 200, "temperature": 0, "enable_thinking": False,
-        }).encode()
-        req = urllib.request.Request(rw.base + "/v1/chat/completions", data=body,
-                                     headers={"Authorization": "Bearer " + rw.key,
-                                              "Content-Type": "application/json"})
-        ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(req, timeout=rw.timeout, context=ctx) as r:
-            raw = json.loads(r.read().decode())["choices"][0]["message"]["content"]
-    except Exception as e:
-        if verbose:
-            print("  [multi_query] 失败:", str(e)[:70])
-        return []
-
-    out = []
-    for ln in raw.split("\n"):
-        ln = re.sub(r"^\s*[\d\-•*.)\]\s]+", "", ln).strip().strip('"\'')
-        if 6 <= len(ln) <= 70 and not re.search(r"[\u4e00-\u9fff]", ln):
-            out.append(ln)
-    out = out[:n]
-    if out:
-        rw._cache_put("MQ::" + q, out)
-    return out
+    # 旧版调用名，保留兼容
+    rewrite = variants

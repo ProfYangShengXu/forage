@@ -24,3 +24,13 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ── agent 工作笔记 / 派活工单（描述过程，不是结果）
+.chen/
+REWORK-*.md
+TASK.md
+
+# ── 本地缓存与备份
+.cache/
+*.bak-*
+*.bak

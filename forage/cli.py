@@ -1,33 +1,54 @@
-"""forage · 命令行入口
+"""forage · 命令行入口。
 
-用法：
-  python -m forage init
-  python -m forage sources
-  python -m forage add all --limit 40
-  python -m forage add meituan infoq --limit 20
-  python -m forage search "数据库选型" --k 8
-  python -m forage search "JSONB 索引" --json
-  python -m forage stats
+    python -m forage crawl  --source <key|all> [--limit N] [--force]   # 抓取入库（增量）
+    python -m forage search "<query>" [-k N] [--no-rewrite] [--json]
+                            [--weights 1.0,0.15,0.15,0.15,0.15] [--rewrite-weight W] [--budget B]
+    python -m forage explain "<query>" [-k N] [--doc <URL子串>] [--weights ...]
+    python -m forage eval   [--build] [-k N] [--weights ...]
+    python -m forage sources                                            # 列源
+    python -m forage stats                                              # 库里有多少（查 PG）
+
+不做什么：
+  ❌ 不做 ``init``（schema 归 memory-bridge，用 ``memory init-db``）
+  ❌ 不加交互式 UI
 """
-import sys, argparse, json, time
 
-# Windows 控制台 UTF-8（否则中文输出乱码/崩）
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+# Windows / 非 UTF-8 控制台下中文输出不乱码
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-from . import db, sources, search as searcher, ingest
+from . import sources  # noqa: E402
 
 
-def cmd_init(a):
-    c = db.init()
-    print("✓ 库已初始化:", db.DB_PATH)
-    print(json.dumps(db.stats(c), ensure_ascii=False, indent=2))
+def _parse_weights(raw: str | None) -> list[float] | None:
+    if not raw:
+        return None
+    try:
+        values = [float(x) for x in raw.split(",") if x.strip() != ""]
+    except ValueError:
+        raise SystemExit(f"--weights 需要逗号分隔的数字，例如 1.0,0.15,0.15，收到：{raw!r}")
+    if not values:
+        return None
+    return values
 
 
-def cmd_sources(a):
+def _fmt_weights(labels: list[str], weights: list[float]) -> str:
+    return "  ".join(
+        f"路{i}({labels[i] if i < len(labels) else '?'})={w:.3f}"
+        for i, w in enumerate(weights)
+    )
+
+
+def cmd_sources(args) -> int:
     print("%-13s %-18s %-6s %-5s %s" % ("key", "名称", "语言", "类", "url"))
     print("-" * 96)
     for cat in ("db", "sys", "ai"):
@@ -36,144 +57,325 @@ def cmd_sources(a):
             continue
         label = {"db": "数据库", "sys": "系统/后端", "ai": "AI/Agent"}[cat]
         print("── %s ──" % label)
-        for k, v in rows:
-            print("%-13s %-18s %-6s %-5s %s" % (k, v["name"], v["lang"], cat, v["url"]))
+        for key, cfg in rows:
+            print("%-13s %-18s %-6s %-5s %s" % (key, cfg["name"], cfg["lang"], cat, cfg["url"]))
     print()
-    print("按类抓取:  forage add --cat db     (或 sys / ai)")
+    print(f"共 {len(sources.SOURCES)} 个源。抓取：forage crawl --source all")
+    return 0
 
 
-def cmd_add(a):
-    c = db.init()
-    if a.source == ["all"]:
+def cmd_crawl(args) -> int:
+    from .crawl import MANIFEST_PATH, StoreUnavailable, crawl
+
+    if args.source == "all":
         keys = list(sources.SOURCES)
-    elif a.source == ["--cat"] or (len(a.source) == 1 and a.source[0] in ("db", "sys", "ai")):
-        keys = [k for k, v in sources.SOURCES.items() if v.get("cat") == a.source[0]]
-        if not keys:
-            print("该类下没有源"); return
+    elif args.source in sources.SOURCES:
+        keys = [args.source]
     else:
-        keys = a.source
-    bad = [k for k in keys if k not in sources.SOURCES]
-    if bad:
-        print("未知源:", bad); return
-    t0 = time.time()
-    total = {"ok": 0, "skip": 0, "fail": 0}
-    for k in keys:
-        st = ingest.ingest_source(c, k, limit=a.limit, verbose=True)
-        for kk in st:
-            total[kk] = total.get(kk, 0) + st[kk]
-        print("    → %s: ok=%d skip=%d fail=%d" % (
-            sources.SOURCES[k]["name"], st.get("ok",0), st.get("skip",0), st.get("fail",0)))
-        print()
+        print(f"未知源：{args.source}（用 forage sources 看清单）", file=sys.stderr)
+        return 2
+
+    if args.force:
+        print(f"[force] 忽略内容清单重算 embedding（清单：{MANIFEST_PATH}）")
+    try:
+        return crawl(keys, limit=args.limit, verbose=True, force=args.force)
+    except StoreUnavailable as exc:
+        print(f"[fatal] {exc}", file=sys.stderr)
+        return 3
+
+
+def _fmt_hit(index: int, hit, labels: list[str]) -> str:
+    doc = hit.doc
+    detail = " ".join(
+        f"路{i}({labels[i] if i < len(labels) else '?'}) rank={hit.route_ranks[i]}"
+        for i in sorted(hit.route_ranks)
+    )
+    section = getattr(doc, "section", None) or "-"
+    snippet = " ".join((getattr(doc, "text", "") or "").split())[:160]
+    return (
+        f"[{index}] rrf={hit.score:.5f} 命中{hit.n_routes}路  {detail}\n"
+        f"    section={section}  {doc.source_doc}\n"
+        f"    {snippet}"
+    )
+
+
+def cmd_search(args) -> int:
+    from .recall import search
+
+    weights = _parse_weights(args.weights)
+    result = search(
+        args.query,
+        k=args.k,
+        rewrite=not args.no_rewrite,
+        weights=weights,
+        rewrite_weight=args.rewrite_weight,
+        share_budget=not args.no_share_budget,
+        rewrite_budget=args.budget,
+        dampen_original=args.dampen,
+        verbose=not args.json,
+    )
+    labels = result.route_labels
+
+    if args.json:
+        payload = {
+            "query": result.query,
+            "variants": result.variants,
+            "rewrite_error": result.rewrite_error,
+            "route_labels": labels,
+            "weights": result.weights,
+            "per_route": result.per_route,
+            "hits": [
+                {
+                    "rank": i,
+                    "id": hit.doc.id,
+                    "score": hit.score,
+                    "n_routes": hit.n_routes,
+                    "routes": [labels[r] for r in hit.routes],
+                    "route_ranks": {labels[r]: k for r, k in hit.route_ranks.items()},
+                    "source_doc": hit.doc.source_doc,
+                    "section": hit.doc.section,
+                    "text": hit.doc.text,
+                }
+                for i, hit in enumerate(result.hits, 1)
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"query: {result.query}   (k={args.k}, 命中 {len(result.hits)})")
+    if result.rewrite_error:
+        print(f"改写: 不可用（{result.rewrite_error}）→ fail-open，只跑原 query")
+    elif result.variants:
+        print(f"改写成 {len(result.variants)} 路英文：")
+        for i, variant in enumerate(result.variants, 1):
+            print(f"   路{i}: {variant}")
+    else:
+        print("改写: 未启用或空 query")
+    if result.weights:
+        print(f"权重: {_fmt_weights(labels, result.weights)}  (RRF rrf_k=60, 0-based)")
     print("=" * 88)
-    print("合计 ok=%d skip=%d fail=%d  用时 %.1fs" % (
-        total["ok"], total["skip"], total["fail"], time.time() - t0))
-    print(json.dumps(db.stats(c), ensure_ascii=False, indent=2))
+    if not result.hits:
+        print("（无结果）")
+    for i, hit in enumerate(result.hits, 1):
+        print(_fmt_hit(i, hit, labels))
+        print()
+    return 0
 
 
-def cmd_search(a):
-    c = db.init()
-    t0 = time.time()
-    if a.no_rewrite:
-        rows = searcher.search(c, a.query, k=a.k,
-                               since=a.since, before=a.before,
-                               source=a.source, lang=a.lang,
-                               dedup_root=not a.no_dedup)
-    else:
-        rows = searcher.search_multi(c, a.query, k=a.k, do_rewrite=True,
-                                     since=a.since, before=a.before,
-                                     source=a.source, lang=a.lang,
-                                     dedup_root=not a.no_dedup, verbose=not a.json,
-                                     do_mmr=a.mmr, mmr_lambda=a.mmr_lambda,
-                                     do_multiquery=a.multi_query)
-    dt = time.time() - t0
-    if a.json:
-        print(json.dumps(rows, ensure_ascii=False, indent=2))
-    else:
-        n_via = len({r.get("via") for r in rows if r.get("via")})
-        print("query: %s   (k=%d, 命中 %d, %d 路, %.1fs)" % (a.query, a.k, len(rows), n_via, dt))
-        print("=" * 88)
-        print(searcher.fmt(rows, max_chars=a.chars))
-        if not rows:
-            print("（无结果）")
-            print("★ 排查：forage search \"<英文术语>\" --no-rewrite 试英文；"
-                  "若英文也 0 → 用 LIKE 直查确认是否内容缺失")
+def cmd_explain(args) -> int:
+    from .explain import explain
+
+    weights = _parse_weights(args.weights)
+    er = explain(
+        args.query,
+        k=args.k,
+        rewrite=not args.no_rewrite,
+        weights=weights,
+        rewrite_weight=args.rewrite_weight,
+        share_budget=not args.no_share_budget,
+        rewrite_budget=args.budget,
+        dampen_original=args.dampen,
+        doc=args.doc,
+        scan_k=args.scan_k,
+    )
+    result = er.result
+    labels = result.route_labels
+
+    if args.json:
+        payload = {
+            "query": result.query,
+            "variants": result.variants,
+            "route_labels": labels,
+            "weights": result.weights,
+            "per_route": result.per_route,
+            "hits": [
+                {
+                    "rank": i,
+                    "source_doc": hit.doc.source_doc,
+                    "section": hit.doc.section,
+                    "rrf": hit.score,
+                    "route_detail": [
+                        {
+                            "route": r,
+                            "label": labels[r],
+                            "rank": hit.route_ranks[r],
+                            "ann_dist": _scan_distance(er, r, hit.doc.id),
+                            "contribution": hit.contribution(r, result.weights),
+                        }
+                        for r in sorted(hit.route_ranks)
+                    ],
+                }
+                for i, hit in enumerate(result.hits, 1)
+            ],
+            "target": er.target,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"query: {result.query}   (k={args.k}, 每路候选父块数={len(er.scans[0].items) if er.scans else 0})")
+    if result.variants:
+        print(f"改写成 {len(result.variants)} 路英文：")
+        for i, variant in enumerate(result.variants, 1):
+            print(f"   路{i}: {variant}")
+    print(f"权重: {_fmt_weights(labels, result.weights)}  (RRF rrf_k=60, 0-based)")
+    print("=" * 96)
+    print("每条结果：命中的路 / 该路名次 / 该路原始 ANN 距离(sim=1-dist，越大越相关) / RRF 贡献")
+    for i, hit in enumerate(result.hits, 1):
+        print(f"\n[{i}] rrf={hit.score:.5f}  {hit.doc.source_doc}")
+        print(f"    section={hit.doc.section or '-'}")
+        for r in sorted(hit.route_ranks):
+            dist = _scan_distance(er, r, hit.doc.id)
+            dist_s = f"{dist:.4f}" if dist is not None else "?"
+            sim_s = f"{(1 - dist):.4f}" if dist is not None else "?"
+            print(
+                f"      路{r}({labels[r]:>6s}) rank={hit.route_ranks[r]:<3d} "
+                f"ann_dist={dist_s} sim={sim_s} "
+                f"contrib={hit.contribution(r, result.weights):.5f}"
+            )
+
+    if er.target:
+        t = er.target
+        print("\n" + "=" * 96)
+        print(f"目标文档排查：{er.target_source_doc}")
+        for r in t["routes"]:
+            if r["rank"] is None:
+                print(f"   路{r['route']}({r['label']:>6s}) w={r['weight']:.3f} 未命中")
+            else:
+                sim = 1 - r["distance"]
+                print(
+                    f"   路{r['route']}({r['label']:>6s}) w={r['weight']:.3f} "
+                    f"rank={r['rank']} ann_dist={r['distance']:.4f} sim={sim:.4f}"
+                )
+        rank_s = t["fused_rank"] if t["fused_rank"] is not None else "未进候选池"
+        print(
+            f"   融合分={t['fused_score']:.5f}  全局名次={rank_s}  "
+            f"命中路={t['hit_routes'] or '无'}  漏掉的路={t['missed_routes'] or '无'}"
+        )
+        print(f"   ★ 结论：{t['verdict']}")
+    return 0
 
 
-def cmd_eval(a):
-    """跑评测：build / run / compare"""
-    from . import eval as EV
-    c = db.init()
-    if a.build:
-        print("重建评测集...")
-        nf, nd = EV.build_set(c, n_fact=a.n_fact, n_decision=a.n_decision, verbose=True)
-        print("→ %d fact + %d decision" % (nf, nd))
-        return
-    if a.compare:
-        base = None
-        for tag, kw in [("A 裸查", dict(do_rewrite=False)),
-                        ("B +改写", dict(do_rewrite=True)),
-                        ("C +改写+MMR", dict(do_rewrite=True, do_mmr=True)),
-                        ("D +改写+MMR+MQ", dict(do_rewrite=True, do_mmr=True, do_multiquery=True))]:
-            r = EV.run_eval(c, k=a.k, tag=tag, **kw)
-            base = base or r
-        return
-    EV.run_eval(c, k=a.k, tag=a.tag, do_rewrite=not a.no_rewrite,
-                do_mmr=a.mmr, do_multiquery=a.multi_query)
+def _scan_distance(er, route_index: int, doc_id: str):
+    """从扫描结果取该路对该文档的 ANN 距离（取不到返回 None）。"""
+    if route_index >= len(er.scans):
+        return None
+    for item in er.scans[route_index].items:
+        if item.doc_id == doc_id:
+            return item.distance
+    return None
 
 
-def cmd_stats(a):
-    c = db.init()
-    print(json.dumps(db.stats(c), ensure_ascii=False, indent=2))
+def cmd_eval(args) -> int:
+    from .eval import build_set, evaluate, load_set, retention
+
+    if args.build:
+        print("重建评测集（调 LLM 生成中文 query，然后冻结）...")
+        build_set(limit=args.limit)
+        print()
+
+    eval_set = load_set()
+    weights = _parse_weights(args.weights)
+    print(f"评测集 n={eval_set.get('n')}  built_at={eval_set.get('built_at')}")
+    print("\n== 改写 vs 不改写 ==")
+    off = evaluate(eval_set, k=args.k, rewrite=False, verbose=True)
+    on = evaluate(
+        eval_set, k=args.k, rewrite=True, weights=weights,
+        dampen_original=args.dampen, rewrite_weight=args.rewrite_weight,
+        share_budget=not args.no_share_budget, rewrite_budget=args.budget, verbose=True,
+    )
+    print(
+        f"  Δ  MRR {on['mrr'] - off['mrr']:+.3f}   "
+        f"NDCG {on['ndcg'] - off['ndcg']:+.3f}   "
+        f"Recall {on['recall'] - off['recall']:+.3f}"
+    )
+    print("\n== 原 query 保留率（带改写 vs 裸查） ==")
+    retention(
+        eval_set, k_top=args.k_top, weights=weights, dampen_original=args.dampen,
+        rewrite_weight=args.rewrite_weight, share_budget=not args.no_share_budget,
+        rewrite_budget=args.budget, verbose=True,
+    )
+    return 0
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(prog="kb", description="forage · 计科 RAG 知识库")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def cmd_stats(args) -> int:
+    from .bridge import get_pipeline
 
-    sub.add_parser("init", help="初始化数据库").set_defaults(fn=cmd_init)
-    sub.add_parser("sources", help="列出可用源").set_defaults(fn=cmd_sources)
-    sub.add_parser("stats", help="库统计").set_defaults(fn=cmd_stats)
+    pipe = get_pipeline()
+    with pipe.store.engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT collection, count(*) AS total, "
+            "count(*) FILTER (WHERE is_parent) AS parents "
+            "FROM chunks GROUP BY collection ORDER BY collection"
+        ).fetchall()
+        memories = conn.exec_driver_sql("SELECT count(*) FROM memories").fetchone()[0]
 
-    pe = sub.add_parser("eval", help="评测（Recall/MRR/NDCG/多样性）")
-    pe.add_argument("--build", action="store_true", help="重建评测集（会调 LLM 生成 query）")
-    pe.add_argument("--compare", action="store_true", help="跑 A/B/C/D 四档对比")
-    pe.add_argument("--n-fact", type=int, default=34)
-    pe.add_argument("--n-decision", type=int, default=12)
-    pe.add_argument("--k", type=int, default=10)
-    pe.add_argument("--tag", default="manual")
-    pe.add_argument("--no-rewrite", action="store_true")
-    pe.add_argument("--mmr", action="store_true")
-    pe.add_argument("--multi-query", action="store_true")
-    pe.set_defaults(fn=cmd_eval)
+    print("collection   total   parents   children")
+    print("-" * 44)
+    for collection, total, parents in rows:
+        print("%-12s %-7d %-9d %d" % (collection, total, parents, total - parents))
+    print(f"\nmemories 表：{memories} 条")
+    return 0
 
-    pa = sub.add_parser("add", help="抓取并入库")
-    pa.add_argument("source", nargs="+", help="源 key 或 all")
-    pa.add_argument("--limit", type=int, default=40)
-    pa.set_defaults(fn=cmd_add)
 
-    ps = sub.add_parser("search", help="检索")
+def _add_weight_args(parser) -> None:
+    parser.add_argument(
+        "--weights",
+        default=None,
+        help="显式各路权重，逗号分隔：1.0,0.15,0.15,0.15,0.15（长度=1 或 原query+改写路数）",
+    )
+    parser.add_argument("--rewrite-weight", type=float, default=None, help="每路改写权重（share 关闭时生效）")
+    parser.add_argument("--budget", type=float, default=0.60, help="改写路合计预算（默认 0.60）")
+    parser.add_argument(
+        "--dampen",
+        type=float,
+        default=None,
+        help="原 query 命中文档的改写加分阻尼（默认 0.35；1.0=经典 RRF 无阻尼）",
+    )
+    parser.add_argument("--no-share-budget", action="store_true", help="不按路均分预算，每路都用 rewrite-weight")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="forage", description="forage · 技术文档爬虫 + 改写召回")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    pc = sub.add_parser("crawl", help="抓取并入库（collection=techblog，内容未变则跳过 embedding）")
+    pc.add_argument("--source", required=True, help="源 key，或 all")
+    pc.add_argument("--limit", type=int, default=40, help="每源抓几条（默认 40）")
+    pc.add_argument("--force", action="store_true", help="忽略内容 hash 清单，强制重算 embedding")
+    pc.set_defaults(fn=cmd_crawl)
+
+    ps = sub.add_parser("search", help="改写召回")
     ps.add_argument("query")
-    ps.add_argument("--k", type=int, default=10)
-    ps.add_argument("--json", action="store_true")
-    ps.add_argument("--since", default=None, help="YYYY-MM-DD")
-    ps.add_argument("--before", default=None)
-    ps.add_argument("--source", default=None)
-    ps.add_argument("--lang", default=None)
-    ps.add_argument("--no-dedup", action="store_true", help="关闭同源去重（看原始排序）")
-    ps.add_argument("--no-rewrite", action="store_true",
-                    help="关闭查询改写（只跑原 query；★ 中文查不到时用来对比诊断）")
-    ps.add_argument("--mmr", action="store_true",
-                    help="MMR 重排（多样性，防同一篇文章多个 chunk 占满 top-K）")
-    ps.add_argument("--mmr-lambda", type=float, default=0.75,
-                    help="MMR 的 λ：越大越重视相关性，越小越重视多样性（默认 0.75）")
-    ps.add_argument("--multi-query", action="store_true",
-                    help="决策型查询自动多视角拆解（A1：治「覆盖不足」）")
-    ps.add_argument("--chars", type=int, default=220)
+    ps.add_argument("-k", "--k", type=int, default=5, help="返回条数（默认 5）")
+    ps.add_argument("--no-rewrite", action="store_true", help="只跑原 query（对照用）")
+    ps.add_argument("--json", action="store_true", help="JSON 输出")
+    _add_weight_args(ps)
     ps.set_defaults(fn=cmd_search)
 
-    a = p.parse_args(argv)
-    a.fn(a)
+    pe = sub.add_parser("explain", help="排查：每条命中的路/名次/原始分；目标文档为什么没进 top-k")
+    pe.add_argument("query")
+    pe.add_argument("-k", "--k", type=int, default=5)
+    pe.add_argument("--doc", default=None, help="目标文档：source_doc 子串（或 chunk id）")
+    pe.add_argument("--scan-k", type=int, default=None, help="每路扫描深度（默认 max(10k,100)）")
+    pe.add_argument("--no-rewrite", action="store_true")
+    pe.add_argument("--json", action="store_true")
+    _add_weight_args(pe)
+    pe.set_defaults(fn=cmd_explain)
+
+    pv = sub.add_parser("eval", help="带标注 query 集上的 Recall/MRR/NDCG + 保留率")
+    pv.add_argument("--build", action="store_true", help="重建评测集（调 LLM，仅此步调 LLM）")
+    pv.add_argument("-k", "--k", type=int, default=10)
+    pv.add_argument("--k-top", type=int, default=5, help="保留率用的 top-k（默认 5）")
+    pv.add_argument("--limit", type=int, default=18, help="build 时采样文档数")
+    _add_weight_args(pv)
+    pv.set_defaults(fn=cmd_eval)
+
+    sub.add_parser("sources", help="列出可用源").set_defaults(fn=cmd_sources)
+    sub.add_parser("stats", help="库里各 collection 的 chunk 数").set_defaults(fn=cmd_stats)
+
+    args = parser.parse_args(argv)
+    return args.fn(args) or 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

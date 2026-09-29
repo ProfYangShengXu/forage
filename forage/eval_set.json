@@ -1,0 +1,109 @@
+{
+  "built_at": "2026-09-29T13:49:31",
+  "model": "Qwen/Qwen3-8B",
+  "n": 17,
+  "queries": [
+    {
+      "query": "企业私有化agent如何统一管理",
+      "source_doc": "https://juejin.cn/post/7690504159464669226",
+      "title": "走向 Memory OS：企业私有化 Agent 设计与实现",
+      "chars": 42506
+    },
+    {
+      "query": "Raft 算法怎么实现的",
+      "source_doc": "https://objcoding.com/2021/12/04/raft-zh_cn/",
+      "title": "Raft: 寻找一种易于理解的一致性算法（扩展版）",
+      "chars": 31395
+    },
+    {
+      "query": "如何用Rust提升Python连接ScyllaDB的速度",
+      "source_doc": "https://www.scylladb.com/2026/09/28/building-a-faster-rust-based-python-driver/",
+      "title": "Building a Faster (Rust-Based) Python Driver for ScyllaDB",
+      "chars": 27005
+    },
+    {
+      "query": "MySQL升级后查询变慢怎么办",
+      "source_doc": "https://aws.amazon.com/blogs/database/resolving-query-plan-regressions-after-a-mysql-engine-upgrade/",
+      "title": "Resolving query plan regressions after a MySQL engine upgrade",
+      "chars": 24473
+    },
+    {
+      "query": "如何在Rust和C#之间实现异步交互",
+      "source_doc": "https://www.scylladb.com/2026/08/31/async-ffi-framework-for-rust-c-interop/",
+      "title": "A Self-Baked Async FFI Framework for Rust < -> C# Interop",
+      "chars": 21320
+    },
+    {
+      "query": "如何理解“劳动君主”这一概念",
+      "source_doc": "http://abailly.github.io/posts/le-souverain-laborieux.html",
+      "title": "Sur \"Le souverain laborieux\"",
+      "chars": 17534
+    },
+    {
+      "query": "Flutter GetX 三件套怎么用",
+      "source_doc": "https://juejin.cn/post/7690512501442428962",
+      "title": "Flutter GetX 三件套开发规范（Skill）",
+      "chars": 16976
+    },
+    {
+      "query": "Vercel 和 TiDB Cloud 如何结合使用",
+      "source_doc": "https://www.pingcap.com/blog/build-with-tidb-cloud-starter-vercel-database/",
+      "title": "Vercel and TiDB Cloud Starter: The Full-Stack Playbook for AI Apps",
+      "chars": 15567
+    },
+    {
+      "query": "分布式 SQL 如何解决金融科技扩展问题",
+      "source_doc": "https://www.pingcap.com/blog/fintech-scalability-crisis-how-distributed-sql-unlocks-innovation-zero-downtime/",
+      "title": "The FinTech Scalability Crisis: How Distributed SQL Unlocks Innovation with Zero Downtime Operations",
+      "chars": 13700
+    },
+    {
+      "query": "如何快速获取业务数据洞察",
+      "source_doc": "https://www.singlestore.com/blog/introducing-singlestore-analyst-question-to-insight-while-it-still-matters",
+      "title": "Introducing Singlestore Analyst : Question to Insight While It Still Matters",
+      "chars": 12531
+    },
+    {
+      "query": "Seata TCC模式怎么用",
+      "source_doc": "https://objcoding.com/2022/01/17/seata-tcc/",
+      "title": "深度剖析 Seata TCC 模式【图解 + 源码分析】",
+      "chars": 10118
+    },
+    {
+      "query": "数据库事务与分析一起处理的技术",
+      "source_doc": "https://www.singlestore.com/blog/apparently-nothing-happened-in-database-history-between-1986-and-monday",
+      "title": "Apparently, Nothing Happened in Database History Between 1986 and Monday",
+      "chars": 10109
+    },
+    {
+      "query": "pgEdge Starfleet 是什么",
+      "source_doc": "https://www.postgresql.org/about/news/pgedge-announces-pgedge-starfleet-a-new-postgres-cloud-platform-to-bridge-the-ai-prototype-to-production-chasm-3389/",
+      "title": "pgEdge Announces pgEdge Starfleet, a New Postgres Cloud Platform to Bridge the AI Prototype to Production Chasm",
+      "chars": 8285
+    },
+    {
+      "query": "MySQL Server 最新培训内容有哪些",
+      "source_doc": "https://www.brentozar.com/archive/2026/09/so-whats-new-lately-in-my-sql-server-training-classes/",
+      "title": "So, What’s New Lately in My SQL Server Training Classes?",
+      "chars": 8047
+    },
+    {
+      "query": "数据库性能优化 page split 问题",
+      "source_doc": "https://www.brentozar.com/archive/2026/09/stop-using-page-splits-to-justify-lowering-fill-factor/",
+      "title": "Database Animations: Stop Using Page Splits to Justify Lowering Fill Factor.",
+      "chars": 6720
+    },
+    {
+      "query": "如何用软件工程解释进化中的表型变异",
+      "source_doc": "http://abailly.github.io/posts/theory-of-facilitated-variations.html",
+      "title": "On \"A theory of facilitated variations\"",
+      "chars": 6421
+    },
+    {
+      "query": "数据处理工具推荐有哪些",
+      "source_doc": "https://dbweekly.com/issues/358",
+      "title": "A bumper collection of our favorite data tools",
+      "chars": 6330
+    }
+  ]
+}
